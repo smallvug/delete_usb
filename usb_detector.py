@@ -30,6 +30,9 @@ Get-Disk | Where-Object { $_.BusType -in @('USB', 'SATA', 'ATA') } | ForEach-Obj
     [PSCustomObject]@{
         Number       = $disk.Number
         FriendlyName = $disk.FriendlyName
+        SerialNumber = $disk.SerialNumber
+        Model        = $disk.Model
+        MediaType    = $disk.MediaType
         BusType      = $disk.BusType
         Size         = $disk.Size
         IsSystem     = $disk.IsSystem
@@ -56,6 +59,9 @@ class DriveInfo:
     size_bytes: int
     is_system: bool
     is_boot: bool
+    serial_number: str = ""
+    model: str = ""
+    media_type: str = ""
     partitions: list[PartitionInfo] = field(default_factory=list)
 
     @property
@@ -135,6 +141,9 @@ def detect_drives() -> list[DriveInfo]:
             size_bytes=disk["Size"],
             is_system=disk.get("IsSystem", False),
             is_boot=disk.get("IsBoot", False),
+            serial_number=disk.get("SerialNumber") or "",
+            model=disk.get("Model") or "",
+            media_type=disk.get("MediaType") or "",
             partitions=partitions,
         ))
 

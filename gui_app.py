@@ -43,6 +43,7 @@ class SecureWiperApp:
         self.cancel_event = threading.Event()
         self.progress_queue: queue.Queue = queue.Queue()
         self.is_wiping = False
+        self._wipe_start_time: float = 0  # 삭제 시작 시간 (예상 소요 시간 계산용)
 
         self._build_ui()
         self._refresh_drives()
@@ -85,6 +86,13 @@ class SecureWiperApp:
         self.tree.column("fs", width=100, anchor="center")
         self.tree.grid(row=0, column=0, sticky="nsew")
         drive_frame.rowconfigure(0, weight=1)
+
+        # 드라이브 문자 경고 태그 (C:, D: 등 익숙한 문자가 있으면 빨간색)
+        self.tree.tag_configure("warn_letter", foreground="red")
+
+        # 마우스 호버 시 상세 정보 툴팁
+        self._tooltip = _TreeTooltip(self.tree)
+        self.tree.bind("<Motion>", self._on_tree_motion)
 
         scrollbar = ttk.Scrollbar(drive_frame, orient="vertical", command=self.tree.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -144,6 +152,35 @@ class SecureWiperApp:
         self.btn_inspect = ttk.Button(btn_frame, text="디스크 검사", command=self._on_inspect)
         self.btn_inspect.grid(row=0, column=2, padx=8)
 
+    # ── 툴팁 ──────────────────────────────────────────────
+
+    # 알려진 시스템 드라이브 문자 (이 문자가 있으면 경고 표시)
+    _WARN_LETTERS = {"C", "D"}
+
+    def _on_tree_motion(self, event):
+        """Treeview 위에서 마우스 이동 시 드라이브 상세 정보 툴팁 표시."""
+        item = self.tree.identify_row(event.y)
+        if not item:
+            self._tooltip.hide()
+            return
+        drive = next((d for d in self.drives if str(d.disk_number) == item), None)
+        if not drive:
+            self._tooltip.hide()
+            return
+        lines = [
+            f"Disk {drive.disk_number}: {drive.friendly_name}",
+            f"모델: {drive.model or '(알 수 없음)'}",
+            f"시리얼: {drive.serial_number or '(알 수 없음)'}",
+            f"미디어: {drive.media_type or '(알 수 없음)'}",
+            f"버스: {drive.bus_type}",
+            f"용량: {drive.size_display}",
+        ]
+        if drive.partitions:
+            for p in drive.partitions:
+                lbl = p.label or ""
+                lines.append(f"  {p.drive_letter or '-'}:  {p.size_gb:.1f} GB  {p.filesystem or '?'}  {lbl}")
+        self._tooltip.show("\n".join(lines), event)
+
     # ── 드라이브 목록 ────────────────────────────────────
 
     def _refresh_drives(self):
@@ -159,13 +196,16 @@ class SecureWiperApp:
         for d in self.drives:
             letters = ", ".join(f"{l}:" for l in d.drive_letters) or "-"
             fs_list = ", ".join(p.filesystem or "?" for p in d.partitions) or "-"
+            # 시스템 드라이브 문자(C:, D:)가 포함된 행은 빨간색 경고
+            has_warn = any(l in self._WARN_LETTERS for l in d.drive_letters)
+            tags = ("warn_letter",) if has_warn else ()
             self.tree.insert("", "end", iid=str(d.disk_number), values=(
                 d.disk_number,
                 d.friendly_name,
                 d.size_display,
                 letters,
                 fs_list,
-            ))
+            ), tags=tags)
 
         self._log(f"{len(self.drives)}개의 디스크를 찾았습니다.")
 
@@ -215,6 +255,7 @@ class SecureWiperApp:
 
         # 워커 스레드 시작
         self.is_wiping = True
+        self._wipe_start_time = time.time()
         self.cancel_event.clear()
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
@@ -306,8 +347,21 @@ class SecureWiperApp:
                     total_str = f"{total_bytes / (1024**3):.1f} GB"
                     if bytes_done > 1024**3:
                         done_str += " GB"
+
+                    # 예상 남은 시간 계산
+                    eta_str = ""
+                    if overall_pct > 0.5:
+                        elapsed = time.time() - self._wipe_start_time
+                        remaining = elapsed * (100 - overall_pct) / overall_pct
+                        if remaining >= 3600:
+                            eta_str = f"  남은 시간: {remaining / 3600:.1f}시간"
+                        elif remaining >= 60:
+                            eta_str = f"  남은 시간: {remaining / 60:.0f}분"
+                        else:
+                            eta_str = f"  남은 시간: {remaining:.0f}초"
+
                     self.lbl_progress.configure(
-                        text=f"Pass {pass_num} ({name_kr}) — {done_str} / {total_str}  [{overall_pct:.0f}%]"
+                        text=f"Pass {pass_num} ({name_kr}) — {done_str} / {total_str}  [{overall_pct:.0f}%]{eta_str}"
                     )
 
                 elif msg[0] == "done":
@@ -624,3 +678,42 @@ class HexViewerDialog:
         offset = max(0, min(offset, self.disk_size - _PAGE_SIZE))
         self.current_offset = (offset // 512) * 512
         self._read_and_display()
+
+
+# ── Treeview 툴팁 ────────────────────────────────────────
+
+
+class _TreeTooltip:
+    """Treeview 행 위에 마우스를 올리면 나타나는 툴팁."""
+
+    def __init__(self, widget: ttk.Treeview):
+        self.widget = widget
+        self.tip: tk.Toplevel | None = None
+        self._current_item = ""
+
+    def show(self, text: str, event):
+        item = self.widget.identify_row(event.y)
+        if item == self._current_item and self.tip:
+            return
+        self.hide()
+        self._current_item = item
+
+        x = self.widget.winfo_rootx() + event.x + 20
+        y = self.widget.winfo_rooty() + event.y + 15
+
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+
+        label = tk.Label(
+            self.tip, text=text, justify="left",
+            background="#ffffe0", relief="solid", borderwidth=1,
+            font=("Consolas", 9), padx=6, pady=4,
+        )
+        label.pack()
+
+    def hide(self):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+            self._current_item = ""
