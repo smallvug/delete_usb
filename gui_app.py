@@ -19,7 +19,11 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from disk_wiper import DiskWiper, WipeConfig, WipeResult, get_disk_size, read_disk_sectors
+from disk_wiper import (
+    DiskWiper, SecureEraseInfo, VerifyResult, WipeConfig, WipeResult,
+    ata_secure_erase, check_secure_erase,
+    get_disk_size, read_disk_sectors, verify_disk_wipe,
+)
 from usb_detector import DriveInfo, refresh_drives
 
 logger = logging.getLogger(__name__)
@@ -28,6 +32,17 @@ PASS_NAMES_KR = {
     "zeros": "제로 (0x00)",
     "ones": "원스 (0xFF)",
     "random": "랜덤",
+}
+
+# 다크 모드 색상 (clam 테마 기반)
+_DARK = {
+    "bg": "#2d2d2d",
+    "fg": "#d4d4d4",
+    "field": "#1e1e1e",
+    "button": "#3d3d3d",
+    "select": "#264f78",
+    "tree_head": "#3d3d3d",
+    "border": "#555555",
 }
 
 
@@ -44,6 +59,8 @@ class SecureWiperApp:
         self.progress_queue: queue.Queue = queue.Queue()
         self.is_wiping = False
         self._wipe_start_time: float = 0  # 삭제 시작 시간 (예상 소요 시간 계산용)
+        self._is_dark = False
+        self._default_theme = ttk.Style().theme_use()
 
         self._build_ui()
         self._refresh_drives()
@@ -152,6 +169,12 @@ class SecureWiperApp:
         self.btn_inspect = ttk.Button(btn_frame, text="디스크 검사", command=self._on_inspect)
         self.btn_inspect.grid(row=0, column=2, padx=8)
 
+        self.btn_secure_erase = ttk.Button(btn_frame, text="Secure Erase", command=self._on_secure_erase)
+        self.btn_secure_erase.grid(row=0, column=3, padx=8)
+
+        self.btn_theme = ttk.Button(btn_frame, text="다크 모드", command=self._toggle_theme)
+        self.btn_theme.grid(row=0, column=4, padx=8)
+
     # ── 툴팁 ──────────────────────────────────────────────
 
     # 알려진 시스템 드라이브 문자 (이 문자가 있으면 경고 표시)
@@ -258,6 +281,7 @@ class SecureWiperApp:
         self._wipe_start_time = time.time()
         self.cancel_event.clear()
         self.btn_start.configure(state="disabled")
+        self.btn_secure_erase.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
         self.btn_refresh.configure(state="disabled")
         self.progress["value"] = 0
@@ -271,7 +295,7 @@ class SecureWiperApp:
         )
         self.wipe_thread.start()
 
-    def _confirm_wipe_dialog(self, drive: DriveInfo) -> bool:
+    def _confirm_wipe_dialog(self, drive: DriveInfo, mode_text: str | None = None) -> bool:
         """'WIPE' 타이핑 확인 다이얼로그."""
         dialog = tk.Toplevel(self.root)
         dialog.title("삭제 확인")
@@ -282,7 +306,11 @@ class SecureWiperApp:
 
         result = {"confirmed": False}
 
-        mode = "표준 (3 pass)" if self.wipe_mode.get() == "standard" else "빠른 (1 pass)"
+        if mode_text is None:
+            _modes = {"quick": "빠른 (1 pass)", "standard": "표준 (3 pass)", "thorough": "정밀 (7 pass)"}
+            mode = _modes.get(self.wipe_mode.get(), "표준 (3 pass)")
+        else:
+            mode = mode_text
         letters = ", ".join(f"{l}:" for l in drive.drive_letters) or "-"
 
         ttk.Label(dialog, text="⚠ 경고: 모든 데이터가 영구적으로 파괴됩니다!", font=("", 11, "bold"), foreground="red").pack(pady=(15, 10))
@@ -331,6 +359,16 @@ class SecureWiperApp:
 
         wiper = DiskWiper(disk_number, config)
         result = wiper.wipe(progress_callback=callback, cancel_event=self.cancel_event)
+
+        # 삭제 성공 시 상세 검증
+        if result.success and config.verify:
+            self.progress_queue.put(("verify_start",))
+            try:
+                disk_size = get_disk_size(disk_number)
+                result.verify_result = verify_disk_wipe(disk_number, disk_size)
+            except Exception as e:
+                logger.warning(f"상세 검증 실패: {e}")
+
         self.progress_queue.put(("done", result))
 
     def _poll_progress(self):
@@ -364,10 +402,14 @@ class SecureWiperApp:
                         text=f"Pass {pass_num} ({name_kr}) — {done_str} / {total_str}  [{overall_pct:.0f}%]{eta_str}"
                     )
 
+                elif msg[0] == "verify_start":
+                    self.lbl_progress.configure(text="검증 중... (랜덤 섹터 샘플링)")
+
                 elif msg[0] == "done":
                     result: WipeResult = msg[1]
                     self.is_wiping = False
                     self.btn_start.configure(state="normal")
+                    self.btn_secure_erase.configure(state="normal")
                     self.btn_cancel.configure(state="disabled")
                     self.btn_refresh.configure(state="normal")
 
@@ -375,12 +417,50 @@ class SecureWiperApp:
                         self.progress["value"] = 100
                         self.lbl_progress.configure(text="완료!")
                         self._log(f"✓ {result.message}")
-                        messagebox.showinfo("완료", result.message, parent=self.root)
+
+                        if result.verify_result:
+                            vr = result.verify_result
+                            v_msg = (
+                                f"{vr.total_samples}개 섹터 검사 → "
+                                f"{vr.clean_samples}개 정상 ({vr.clean_pct:.0f}%)"
+                            )
+                            if vr.dirty_samples > 0:
+                                v_msg += f", {vr.dirty_samples}개 의심"
+                            self._log(f"  검증: {v_msg}")
+                            full = f"{result.message}\n\n[검증 결과]\n{v_msg}"
+                            if vr.clean_pct >= 100:
+                                messagebox.showinfo("완료", full, parent=self.root)
+                            else:
+                                messagebox.showwarning("완료 (검증 주의)", full, parent=self.root)
+                        else:
+                            messagebox.showinfo("완료", result.message, parent=self.root)
                     elif result.cancelled:
                         self.lbl_progress.configure(text="취소됨")
                         self._log(f"취소: {result.message}")
                     else:
                         self.lbl_progress.configure(text="실패")
+                        self._log(f"✗ {result.message}")
+                        messagebox.showerror("오류", result.message, parent=self.root)
+
+                    self._refresh_drives()
+
+                elif msg[0] == "se_done":
+                    result: WipeResult = msg[1]
+                    self.is_wiping = False
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate")
+                    self.btn_start.configure(state="normal")
+                    self.btn_secure_erase.configure(state="normal")
+                    self.btn_refresh.configure(state="normal")
+
+                    if result.success:
+                        self.progress["value"] = 100
+                        self.lbl_progress.configure(text="Secure Erase 완료!")
+                        self._log(f"✓ {result.message}")
+                        messagebox.showinfo("완료", result.message, parent=self.root)
+                    else:
+                        self.progress["value"] = 0
+                        self.lbl_progress.configure(text="Secure Erase 실패")
                         self._log(f"✗ {result.message}")
                         messagebox.showerror("오류", result.message, parent=self.root)
 
@@ -398,6 +478,153 @@ class SecureWiperApp:
             if messagebox.askyesno("취소 확인", "삭제를 취소하시겠습니까?\n(현재 진행 중인 쓰기 이후 중단됩니다)", parent=self.root):
                 self.cancel_event.set()
                 self._log("취소 요청됨... 현재 청크 완료 후 중단합니다.")
+
+    # ── ATA Secure Erase ────────────────────────────────
+
+    def _on_secure_erase(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("선택 필요", "디스크를 선택해주세요.", parent=self.root)
+            return
+
+        disk_num = int(selected[0])
+        drive = next((d for d in self.drives if d.disk_number == disk_num), None)
+        if not drive:
+            messagebox.showerror("오류", "선택한 드라이브를 찾을 수 없습니다.", parent=self.root)
+            return
+
+        # 지원 여부 확인
+        try:
+            info = check_secure_erase(disk_num)
+        except OSError as e:
+            messagebox.showerror(
+                "Secure Erase 불가",
+                f"ATA pass-through을 지원하지 않는 디스크입니다.\n"
+                f"(USB 연결 디스크는 대부분 미지원)\n\n{e}",
+                parent=self.root,
+            )
+            return
+
+        if not info.supported:
+            messagebox.showinfo("미지원", "이 드라이브는 ATA Secure Erase를 지원하지 않습니다.", parent=self.root)
+            return
+
+        if info.frozen:
+            messagebox.showwarning(
+                "Frozen 상태",
+                "드라이브가 'Frozen' 상태입니다.\n\n"
+                "해제 방법:\n"
+                "1. PC를 절전 모드로 전환 후 깨우기\n"
+                "2. 또는 드라이브를 핫플러그 (분리 후 재연결)\n\n"
+                "이후 다시 시도해주세요.",
+                parent=self.root,
+            )
+            return
+
+        if info.locked:
+            messagebox.showerror("잠금 상태", "드라이브가 잠금 상태입니다.\n비밀번호를 해제해야 합니다.", parent=self.root)
+            return
+
+        if info.enabled:
+            messagebox.showerror("보안 활성", "드라이브에 이미 보안 비밀번호가 설정되어 있습니다.", parent=self.root)
+            return
+
+        # Enhanced 가능 시 Enhanced 사용
+        enhanced = info.enhanced_supported
+        mode_str = "Enhanced" if enhanced else "Normal"
+        time_est = info.enhanced_time_min if enhanced else info.normal_time_min
+        time_str = f"약 {time_est}분" if time_est > 0 else "알 수 없음"
+
+        if not messagebox.askyesno(
+            "ATA Secure Erase",
+            f"ATA Secure Erase ({mode_str}) 실행\n\n"
+            f"드라이브: {drive.friendly_name}\n"
+            f"용량: {drive.size_display}\n"
+            f"예상 소요: {time_str}\n\n"
+            "펌웨어 레벨에서 모든 데이터를 삭제합니다.\n"
+            "SSD는 소프트웨어 삭제보다 더 확실합니다.\n\n"
+            "계속하시겠습니까?",
+            parent=self.root,
+        ):
+            return
+
+        if not self._confirm_wipe_dialog(drive, mode_text=f"Secure Erase ({mode_str})"):
+            return
+
+        # 실행
+        self.is_wiping = True
+        self._wipe_start_time = time.time()
+        self.cancel_event.clear()
+        self.btn_start.configure(state="disabled")
+        self.btn_secure_erase.configure(state="disabled")
+        self.btn_cancel.configure(state="disabled")  # Secure Erase는 취소 불가
+        self.btn_refresh.configure(state="disabled")
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(10)
+
+        self._log(f"Disk {disk_num}: ATA Secure Erase ({mode_str}) 시작")
+
+        self.wipe_thread = threading.Thread(
+            target=self._secure_erase_worker,
+            args=(disk_num, enhanced),
+            daemon=True,
+        )
+        self.wipe_thread.start()
+
+    def _secure_erase_worker(self, disk_number: int, enhanced: bool):
+        result = ata_secure_erase(disk_number, enhanced)
+        self.progress_queue.put(("se_done", result))
+
+    # ── 테마 ─────────────────────────────────────────────
+
+    def _toggle_theme(self):
+        """다크/라이트 모드 전환."""
+        self._is_dark = not self._is_dark
+        self._apply_theme()
+
+    def _apply_theme(self):
+        """현재 테마를 모든 위젯에 적용."""
+        style = ttk.Style()
+        if self._is_dark:
+            style.theme_use("clam")
+            c = _DARK
+            style.configure(".", background=c["bg"], foreground=c["fg"],
+                            fieldbackground=c["field"], bordercolor=c["border"])
+            style.configure("TLabel", background=c["bg"], foreground=c["fg"])
+            style.configure("TButton", background=c["button"], foreground=c["fg"])
+            style.configure("TFrame", background=c["bg"])
+            style.configure("TLabelframe", background=c["bg"], foreground=c["fg"])
+            style.configure("TLabelframe.Label", background=c["bg"], foreground=c["fg"])
+            style.configure("TRadiobutton", background=c["bg"], foreground=c["fg"],
+                            indicatorcolor=c["field"])
+            style.configure("TCheckbutton", background=c["bg"], foreground=c["fg"],
+                            indicatorcolor=c["field"])
+            style.configure("Treeview", background=c["field"], foreground=c["fg"],
+                            fieldbackground=c["field"])
+            style.configure("Treeview.Heading", background=c["tree_head"],
+                            foreground=c["fg"])
+            style.map("Treeview",
+                       background=[("selected", c["select"])],
+                       foreground=[("selected", "#ffffff")])
+            style.map("TButton", background=[("active", "#505050")])
+            style.configure("TProgressbar", background="#569cd6",
+                            troughcolor=c["field"])
+
+            self.root.configure(bg=c["bg"])
+            self.log_text.configure(bg=c["field"], fg=c["fg"],
+                                    insertbackground=c["fg"])
+            self.tree.tag_configure("warn_letter", foreground="#ff6b6b")
+            self._tooltip.bg = "#3d3d3d"
+            self._tooltip.fg = "#d4d4d4"
+            self.btn_theme.configure(text="라이트 모드")
+        else:
+            style.theme_use(self._default_theme)
+            self.root.configure(bg="SystemButtonFace")
+            self.log_text.configure(bg="white", fg="black", insertbackground="black")
+            self.tree.tag_configure("warn_letter", foreground="red")
+            self._tooltip.bg = "#ffffe0"
+            self._tooltip.fg = "#000000"
+            self.btn_theme.configure(text="다크 모드")
 
     # ── 디스크 검사 (헥스 뷰어) ────────────────────────────
 
@@ -690,6 +917,8 @@ class _TreeTooltip:
         self.widget = widget
         self.tip: tk.Toplevel | None = None
         self._current_item = ""
+        self.bg = "#ffffe0"
+        self.fg = "#000000"
 
     def show(self, text: str, event):
         item = self.widget.identify_row(event.y)
@@ -707,7 +936,8 @@ class _TreeTooltip:
 
         label = tk.Label(
             self.tip, text=text, justify="left",
-            background="#ffffe0", relief="solid", borderwidth=1,
+            background=self.bg, foreground=self.fg,
+            relief="solid", borderwidth=1,
             font=("Consolas", 9), padx=6, pady=4,
         )
         label.pack()

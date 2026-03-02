@@ -37,10 +37,46 @@ FSCTL_LOCK_VOLUME = 0x00090018            # 볼륨 독점 잠금 (다른 프로�
 FSCTL_UNLOCK_VOLUME = 0x0009001C          # 볼륨 잠금 해제
 FSCTL_DISMOUNT_VOLUME = 0x00090020        # 볼륨 마운트 해제 (파일시스템 분리)
 
+# ATA pass-through (Secure Erase용)
+IOCTL_ATA_PASS_THROUGH = 0x4D02C
+ATA_FLAGS_DRDY_REQUIRED = 0x01
+ATA_FLAGS_DATA_IN = 0x02
+ATA_FLAGS_DATA_OUT = 0x04
+ATA_CMD_IDENTIFY = 0xEC
+ATA_CMD_SECURITY_SET_PASSWORD = 0xF1
+ATA_CMD_SECURITY_ERASE_UNIT = 0xF4
+ATA_CMD_SECURITY_DISABLE_PASSWORD = 0xF6
+
 # 쓰기 단위: 1MB (512바이트 정렬 보장, USB 3.0 기준 ~10ms/청크)
 CHUNK_SIZE = 1024 * 1024
 
 kernel32 = ctypes.windll.kernel32
+
+
+class _AtaPassThroughEx(ctypes.Structure):
+    """ATA_PASS_THROUGH_EX 구조체 (Windows ntddscsi.h)."""
+    _fields_ = [
+        ("Length", ctypes.c_ushort),
+        ("AtaFlags", ctypes.c_ushort),
+        ("PathId", ctypes.c_ubyte),
+        ("TargetId", ctypes.c_ubyte),
+        ("Lun", ctypes.c_ubyte),
+        ("ReservedAsUchar", ctypes.c_ubyte),
+        ("DataTransferLength", ctypes.c_ulong),
+        ("TimeOutValue", ctypes.c_ulong),
+        ("ReservedAsUlong", ctypes.c_ulong),
+        ("DataBufferOffset", ctypes.c_size_t),  # ULONG_PTR
+        ("PreviousTaskFile", ctypes.c_ubyte * 8),
+        ("CurrentTaskFile", ctypes.c_ubyte * 8),
+    ]
+
+
+class _AtaPassThroughBuf(ctypes.Structure):
+    """ATA_PASS_THROUGH_EX + 512바이트 데이터 버퍼."""
+    _fields_ = [
+        ("apt", _AtaPassThroughEx),
+        ("data", ctypes.c_ubyte * 512),
+    ]
 
 
 @dataclass
@@ -51,10 +87,32 @@ class WipeConfig:
 
 
 @dataclass
+class VerifyResult:
+    """삭제 후 검증 결과."""
+    total_samples: int
+    clean_samples: int
+    dirty_samples: int
+    clean_pct: float
+
+
+@dataclass
+class SecureEraseInfo:
+    """ATA Secure Erase 지원 상태."""
+    supported: bool
+    frozen: bool
+    locked: bool
+    enabled: bool       # 이미 비밀번호가 설정된 상태
+    enhanced_supported: bool
+    normal_time_min: int
+    enhanced_time_min: int
+
+
+@dataclass
 class WipeResult:
     success: bool
     message: str
     cancelled: bool = False
+    verify_result: VerifyResult | None = None
 
 
 # 진행률 콜백 시그니처:
@@ -425,3 +483,233 @@ def get_disk_size(disk_number: int) -> int:
         return length_info.value
     finally:
         kernel32.CloseHandle(handle)
+
+
+def verify_disk_wipe(disk_number: int, disk_size: int, num_samples: int = 50) -> VerifyResult:
+    """삭제된 디스크를 랜덤 섹터 샘플링으로 검증.
+
+    각 샘플(4KB)이 '삭제됨' 상태인지 확인:
+    - 95% 이상 0x00 또는 0xFF → 정상 (패턴 삭제)
+    - 고유 바이트 200종 이상 → 정상 (랜덤 삭제)
+    - 그 외 → 원본 데이터 잔존 가능
+    """
+    import random
+
+    SAMPLE_SIZE = 4096
+    clean = 0
+    dirty = 0
+
+    path = rf"\\.\PhysicalDrive{disk_number}"
+    handle = kernel32.CreateFileW(
+        path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None, OPEN_EXISTING, 0, None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        raise OSError(f"검증용 디스크 열기 실패 (error={ctypes.GetLastError()})")
+
+    try:
+        for _ in range(num_samples):
+            offset = random.randrange(0, max(1, disk_size - SAMPLE_SIZE), 512)
+
+            new_pos = ctypes.c_longlong(0)
+            kernel32.SetFilePointerEx(
+                handle, ctypes.c_longlong(offset), ctypes.byref(new_pos), 0,
+            )
+
+            buf = ctypes.create_string_buffer(SAMPLE_SIZE)
+            read_count = ctypes.wintypes.DWORD(0)
+            ok = kernel32.ReadFile(handle, buf, SAMPLE_SIZE, ctypes.byref(read_count), None)
+            if not ok or read_count.value == 0:
+                continue
+
+            data = buf.raw[: read_count.value]
+            zero_count = data.count(0)
+            ff_count = data.count(0xFF)
+            threshold = len(data) * 0.95
+
+            if zero_count >= threshold or ff_count >= threshold:
+                clean += 1
+            elif len(set(data)) > 200:
+                clean += 1
+            else:
+                dirty += 1
+
+        total = clean + dirty
+        return VerifyResult(
+            total_samples=total,
+            clean_samples=clean,
+            dirty_samples=dirty,
+            clean_pct=clean / total * 100 if total > 0 else 0,
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+# ── ATA Secure Erase ─────────────────────────────────────────
+
+_SE_PASSWORD = b"delete_usb"  # Secure Erase용 임시 비밀번호
+
+
+def _ata_passthrough(handle: int, command: int, flags: int,
+                     data_out: bytes | None = None, timeout: int = 10) -> bytes | None:
+    """ATA pass-through 명령을 실행하고 결과를 반환."""
+    buf = _AtaPassThroughBuf()
+    struct_size = ctypes.sizeof(_AtaPassThroughEx)
+
+    buf.apt.Length = struct_size
+    buf.apt.AtaFlags = flags
+    buf.apt.DataTransferLength = 512
+    buf.apt.TimeOutValue = timeout
+    buf.apt.DataBufferOffset = struct_size
+    buf.apt.CurrentTaskFile[6] = command
+
+    if data_out and (flags & ATA_FLAGS_DATA_OUT):
+        for i, b in enumerate(data_out[:512]):
+            buf.data[i] = b
+
+    buf_size = ctypes.sizeof(buf)
+    returned = ctypes.wintypes.DWORD(0)
+    ok = kernel32.DeviceIoControl(
+        handle, IOCTL_ATA_PASS_THROUGH,
+        ctypes.byref(buf), buf_size,
+        ctypes.byref(buf), buf_size,
+        ctypes.byref(returned), None,
+    )
+    if not ok:
+        err = ctypes.GetLastError()
+        raise OSError(f"ATA pass-through 실패 (cmd=0x{command:02X}, error={err})")
+
+    status = buf.apt.CurrentTaskFile[6]
+    if status & 0x01:  # ERR 비트
+        error_reg = buf.apt.CurrentTaskFile[0]
+        raise OSError(
+            f"ATA 명령 실패 (cmd=0x{command:02X}, "
+            f"status=0x{status:02X}, error=0x{error_reg:02X})"
+        )
+
+    if flags & ATA_FLAGS_DATA_IN:
+        return bytes(buf.data)
+    return None
+
+
+def _build_se_data(password: bytes, enhanced: bool = False) -> bytes:
+    """SECURITY SET PASSWORD / SECURITY ERASE UNIT 명령용 512바이트 데이터."""
+    data = bytearray(512)
+    # Word 0 bit 1: 0=normal, 1=enhanced (erase 전용)
+    if enhanced:
+        data[0] = 0x02
+    # Words 1-16 (offset 2~33): 비밀번호 (최대 32바이트)
+    pwd = password[:32].ljust(32, b"\x00")
+    data[2:34] = pwd
+    return bytes(data)
+
+
+def check_secure_erase(disk_number: int) -> SecureEraseInfo:
+    """ATA IDENTIFY DEVICE로 Secure Erase 지원 여부를 확인."""
+    path = rf"\\.\PhysicalDrive{disk_number}"
+    handle = kernel32.CreateFileW(
+        path, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None, OPEN_EXISTING, 0, None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        raise OSError(f"디스크 열기 실패 (error={ctypes.GetLastError()})")
+
+    try:
+        identify = _ata_passthrough(
+            handle, ATA_CMD_IDENTIFY,
+            ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_IN,
+        )
+
+        # Word 128: Security 상태
+        word128 = struct.unpack_from("<H", identify, 128 * 2)[0]
+        # Word 89/90: 삭제 예상 시간
+        word89 = struct.unpack_from("<H", identify, 89 * 2)[0]
+        word90 = struct.unpack_from("<H", identify, 90 * 2)[0]
+
+        def _parse_time(w: int) -> int:
+            if w == 0 or w == 0xFFFF:
+                return 0
+            if w & 0x8000:  # bit 15 → 분 단위
+                return w & 0x7FFF
+            return (w & 0x7FFF) * 2  # 2분 단위
+
+        return SecureEraseInfo(
+            supported=bool(word128 & 0x0001),
+            enabled=bool(word128 & 0x0002),
+            locked=bool(word128 & 0x0004),
+            frozen=bool(word128 & 0x0008),
+            enhanced_supported=bool(word128 & 0x0020),
+            normal_time_min=_parse_time(word89),
+            enhanced_time_min=_parse_time(word90),
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def ata_secure_erase(disk_number: int, enhanced: bool = False) -> WipeResult:
+    """ATA Secure Erase 실행.
+
+    1. 임시 비밀번호 설정 (SECURITY SET PASSWORD)
+    2. SECURITY ERASE UNIT 실행
+    3. 성공 시 비밀번호 자동 해제
+    4. 실패 시 비밀번호 수동 해제 시도
+    """
+    path = rf"\\.\PhysicalDrive{disk_number}"
+    handle = kernel32.CreateFileW(
+        path, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None, OPEN_EXISTING, 0, None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        raise OSError(f"디스크 열기 실패 (error={ctypes.GetLastError()})")
+
+    password_set = False
+    try:
+        # 1. 임시 비밀번호 설정
+        _ata_passthrough(
+            handle, ATA_CMD_SECURITY_SET_PASSWORD,
+            ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_OUT,
+            data_out=_build_se_data(_SE_PASSWORD),
+        )
+        password_set = True
+        logger.info("ATA Security: 임시 비밀번호 설정 완료")
+
+        # 2. Secure Erase 실행 (최대 12시간 타임아웃)
+        _ata_passthrough(
+            handle, ATA_CMD_SECURITY_ERASE_UNIT,
+            ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_OUT,
+            data_out=_build_se_data(_SE_PASSWORD, enhanced=enhanced),
+            timeout=43200,
+        )
+        logger.info("ATA Secure Erase 완료")
+
+        mode = "Enhanced" if enhanced else "Normal"
+        return WipeResult(
+            True,
+            f"ATA Secure Erase ({mode}) 완료.\n"
+            "드라이브를 안전하게 폐기할 수 있습니다.",
+        )
+
+    except Exception as e:
+        logger.error(f"ATA Secure Erase 실패: {e}")
+
+        # 비밀번호 설정 후 erase 실패 → 비밀번호 해제 시도
+        if password_set:
+            try:
+                _ata_passthrough(
+                    handle, ATA_CMD_SECURITY_DISABLE_PASSWORD,
+                    ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_OUT,
+                    data_out=_build_se_data(_SE_PASSWORD),
+                )
+                logger.info("ATA Security: 비밀번호 해제 완료")
+            except Exception as e2:
+                logger.error(f"비밀번호 해제 실패: {e2}")
+                return WipeResult(
+                    False,
+                    f"Secure Erase 실패 + 비밀번호 해제 실패!\n"
+                    f"드라이브가 잠긴 상태일 수 있습니다.\n"
+                    f"오류: {e}",
+                )
+
+        return WipeResult(False, f"ATA Secure Erase 실패: {e}")
