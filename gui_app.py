@@ -34,18 +34,6 @@ PASS_NAMES_KR = {
     "random": "랜덤",
 }
 
-# 다크 모드 색상 (clam 테마 기반)
-_DARK = {
-    "bg": "#2d2d2d",
-    "fg": "#d4d4d4",
-    "field": "#1e1e1e",
-    "button": "#3d3d3d",
-    "select": "#264f78",
-    "tree_head": "#3d3d3d",
-    "border": "#555555",
-}
-
-
 class SecureWiperApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -59,9 +47,6 @@ class SecureWiperApp:
         self.progress_queue: queue.Queue = queue.Queue()
         self.is_wiping = False
         self._wipe_start_time: float = 0  # 삭제 시작 시간 (예상 소요 시간 계산용)
-        self._is_dark = False
-        self._default_theme = ttk.Style().theme_use()
-
         self._build_ui()
         self._refresh_drives()
         self._poll_progress()
@@ -171,9 +156,6 @@ class SecureWiperApp:
 
         self.btn_secure_erase = ttk.Button(btn_frame, text="Secure Erase", command=self._on_secure_erase)
         self.btn_secure_erase.grid(row=0, column=3, padx=8)
-
-        self.btn_theme = ttk.Button(btn_frame, text="다크 모드", command=self._toggle_theme)
-        self.btn_theme.grid(row=0, column=4, padx=8)
 
     # ── 툴팁 ──────────────────────────────────────────────
 
@@ -574,57 +556,6 @@ class SecureWiperApp:
     def _secure_erase_worker(self, disk_number: int, enhanced: bool):
         result = ata_secure_erase(disk_number, enhanced)
         self.progress_queue.put(("se_done", result))
-
-    # ── 테마 ─────────────────────────────────────────────
-
-    def _toggle_theme(self):
-        """다크/라이트 모드 전환."""
-        self._is_dark = not self._is_dark
-        self._apply_theme()
-
-    def _apply_theme(self):
-        """현재 테마를 모든 위젯에 적용."""
-        style = ttk.Style()
-        if self._is_dark:
-            style.theme_use("clam")
-            c = _DARK
-            style.configure(".", background=c["bg"], foreground=c["fg"],
-                            fieldbackground=c["field"], bordercolor=c["border"])
-            style.configure("TLabel", background=c["bg"], foreground=c["fg"])
-            style.configure("TButton", background=c["button"], foreground=c["fg"])
-            style.configure("TFrame", background=c["bg"])
-            style.configure("TLabelframe", background=c["bg"], foreground=c["fg"])
-            style.configure("TLabelframe.Label", background=c["bg"], foreground=c["fg"])
-            style.configure("TRadiobutton", background=c["bg"], foreground=c["fg"],
-                            indicatorcolor=c["field"])
-            style.configure("TCheckbutton", background=c["bg"], foreground=c["fg"],
-                            indicatorcolor=c["field"])
-            style.configure("Treeview", background=c["field"], foreground=c["fg"],
-                            fieldbackground=c["field"])
-            style.configure("Treeview.Heading", background=c["tree_head"],
-                            foreground=c["fg"])
-            style.map("Treeview",
-                       background=[("selected", c["select"])],
-                       foreground=[("selected", "#ffffff")])
-            style.map("TButton", background=[("active", "#505050")])
-            style.configure("TProgressbar", background="#569cd6",
-                            troughcolor=c["field"])
-
-            self.root.configure(bg=c["bg"])
-            self.log_text.configure(bg=c["field"], fg=c["fg"],
-                                    insertbackground=c["fg"])
-            self.tree.tag_configure("warn_letter", foreground="#ff6b6b")
-            self._tooltip.bg = "#3d3d3d"
-            self._tooltip.fg = "#d4d4d4"
-            self.btn_theme.configure(text="라이트 모드")
-        else:
-            style.theme_use(self._default_theme)
-            self.root.configure(bg="SystemButtonFace")
-            self.log_text.configure(bg="white", fg="black", insertbackground="black")
-            self.tree.tag_configure("warn_letter", foreground="red")
-            self._tooltip.bg = "#ffffe0"
-            self._tooltip.fg = "#000000"
-            self.btn_theme.configure(text="다크 모드")
 
     # ── 디스크 검사 (헥스 뷰어) ────────────────────────────
 
