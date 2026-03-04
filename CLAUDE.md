@@ -1,6 +1,6 @@
 # USB Secure Wiper (delete_usb)
 
-현재 버전: 0.9.4
+현재 버전: 0.9.5
 
 폐기할 저장장치(USB, HDD, SSD)의 데이터를 복구 불가능하도록 보안 삭제하는 Windows GUI 프로그램.
 
